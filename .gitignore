@@ -1,0 +1,11 @@
+## .NET
+bin/
+obj/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+
+## Local development settings
+appsettings.Local.json

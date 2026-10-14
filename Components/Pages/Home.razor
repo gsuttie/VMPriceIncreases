@@ -1,0 +1,375 @@
+@page "/"
+@rendermode InteractiveServer
+@using System.Globalization
+@using System.Text
+@using Azure.Identity
+@using VMPriceIncreases.Models
+@using VMPriceIncreases.Services
+@inject VmInventoryService Inventory
+@inject PriceIncreaseCalculator Calculator
+@inject IJSRuntime JS
+@implements IDisposable
+
+<PageTitle>Azure VM Price Increase Impact</PageTitle>
+
+<header class="topbar">
+    <div>
+        <h1>Azure VM price increase impact</h1>
+        <p class="sub">
+            Pay-as-you-go list prices vs. the regional increase effective
+            <strong>@Calculator.Increase.EffectiveDate.ToString("d MMMM yyyy", CultureInfo.InvariantCulture)</strong>.
+            <a href="@Calculator.Increase.SourceUrl" target="_blank" rel="noopener">Source notice</a>
+        </p>
+    </div>
+    <div class="controls">
+        <label>
+            Currency
+            <select value="@currency" @onchange="OnCurrencyChanged" disabled="@isLoading">
+                @foreach (var c in Calculator.Pricing.Currencies)
+                {
+                    <option value="@c">@c</option>
+                }
+            </select>
+        </label>
+        <label class="check">
+            <input type="checkbox" @bind="includeDeallocated" />
+            Include deallocated VMs in totals
+        </label>
+        <button class="btn" @onclick="ReloadAsync" disabled="@isLoading">Refresh</button>
+        <button class="btn secondary" @onclick="DownloadCsvAsync" disabled="@(isLoading || rows.Count == 0)">Download CSV</button>
+    </div>
+</header>
+
+@if (errorMessage is not null)
+{
+    <div class="banner error">
+        <strong>@errorTitle</strong>
+        <p>@errorMessage</p>
+        @if (showLoginHint)
+        {
+            <pre>az login
+az account list --output table</pre>
+            <p>Then click Refresh.</p>
+        }
+    </div>
+}
+
+@if (isLoading)
+{
+    <div class="banner info">
+        <div class="spinner"></div>
+        <div>
+            <strong>@loadingStage</strong>
+            @if (pricingTotal > 0)
+            {
+                <div class="progress"><div class="bar" style="width:@(100 * pricingDone / Math.Max(1, pricingTotal))%"></div></div>
+                <small>@pricingDone / @pricingTotal VMs priced</small>
+            }
+        </div>
+    </div>
+}
+
+@if (rows.Count > 0)
+{
+    var visible = rows.Where(IncludedInTotals).ToList();
+    var totalCurrent = visible.Sum(r => r.MonthlyCost ?? 0);
+    var totalProjected = visible.Sum(r => r.ProjectedMonthly ?? 0);
+    var totalDelta = totalProjected - totalCurrent;
+    var pctOverall = totalCurrent == 0 ? 0 : totalDelta / totalCurrent * 100;
+
+    <section class="summary">
+        <div class="tile">
+            <span class="label">Current monthly</span>
+            <span class="value">@Money(totalCurrent)</span>
+        </div>
+        <div class="tile">
+            <span class="label">Projected monthly</span>
+            <span class="value">@Money(totalProjected)</span>
+        </div>
+        <div class="tile delta">
+            <span class="label">Monthly increase</span>
+            <span class="value">@Money(totalDelta)</span>
+            <small>@pctOverall.ToString("0.0")% overall</small>
+        </div>
+        <div class="tile delta">
+            <span class="label">Annual increase</span>
+            <span class="value">@Money(totalDelta * 12)</span>
+        </div>
+        <div class="tile counts">
+            <span class="label">VMs</span>
+            <span class="value">@rows.Count</span>
+            <small>
+                @Count(IncreaseStatus.Affected) affected ·
+                @Count(IncreaseStatus.Excluded) excluded ·
+                @Count(IncreaseStatus.NotInScope) not in scope ·
+                @Count(IncreaseStatus.PriceUnknown) unpriced ·
+                @rows.Count(r => r.Vm.IsDeallocated) deallocated
+            </small>
+        </div>
+    </section>
+
+    @foreach (var group in rows.GroupBy(r => (r.Vm.SubscriptionId, r.Vm.SubscriptionName)).OrderBy(g => g.Key.SubscriptionName))
+    {
+        var subRows = group.Where(IncludedInTotals).ToList();
+        var subCurrent = subRows.Sum(r => r.MonthlyCost ?? 0);
+        var subProjected = subRows.Sum(r => r.ProjectedMonthly ?? 0);
+        var subDelta = subProjected - subCurrent;
+        var sorted = Sort(group);
+
+        <section class="subscription">
+            <h2>
+                @group.Key.SubscriptionName
+                <small>@group.Key.SubscriptionId · @group.Count() VM@(group.Count() == 1 ? "" : "s")</small>
+            </h2>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th @onclick='() => SortBy("name")'>VM @SortIcon("name")</th>
+                            <th @onclick='() => SortBy("rg")'>Resource group @SortIcon("rg")</th>
+                            <th @onclick='() => SortBy("region")'>Region @SortIcon("region")</th>
+                            <th @onclick='() => SortBy("size")'>Size @SortIcon("size")</th>
+                            <th>Series</th>
+                            <th>OS</th>
+                            <th @onclick='() => SortBy("state")'>State @SortIcon("state")</th>
+                            <th class="num" @onclick='() => SortBy("current")'>Current /mo @SortIcon("current")</th>
+                            <th class="num" @onclick='() => SortBy("pct")'>Increase @SortIcon("pct")</th>
+                            <th class="num" @onclick='() => SortBy("projected")'>Projected /mo @SortIcon("projected")</th>
+                            <th class="num" @onclick='() => SortBy("delta")'>Delta /mo @SortIcon("delta")</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var r in sorted)
+                        {
+                            <tr class="@RowClass(r)" title="@r.Note">
+                                <td>@r.Vm.Name</td>
+                                <td>@r.Vm.ResourceGroup</td>
+                                <td>@r.Vm.Region</td>
+                                <td><code>@r.Vm.VmSize</code></td>
+                                <td>@r.Series@(r.SeriesRecognised ? "" : " ?")</td>
+                                <td>@r.Vm.OsType</td>
+                                <td>@r.Vm.PowerStateDisplay</td>
+                                <td class="num">@MoneyOrDash(r.MonthlyCost)</td>
+                                <td class="num">@(r.IncreasePercent == 0 ? "0%" : $"+{r.IncreasePercent:0.#}%")</td>
+                                <td class="num">@MoneyOrDash(r.ProjectedMonthly)</td>
+                                <td class="num">@MoneyOrDash(r.MonthlyDelta)</td>
+                                <td><span class="pill @r.Status.ToString().ToLowerInvariant()">@StatusText(r.Status)</span></td>
+                            </tr>
+                        }
+                    </tbody>
+                    <tfoot>
+                        <tr>
+                            <td colspan="7">Subscription total@(includeDeallocated ? "" : " (running VMs)")</td>
+                            <td class="num">@Money(subCurrent)</td>
+                            <td class="num">@(subCurrent == 0 ? "" : $"+{subDelta / subCurrent * 100:0.0}%")</td>
+                            <td class="num">@Money(subProjected)</td>
+                            <td class="num">@Money(subDelta)</td>
+                            <td></td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </section>
+    }
+}
+else if (hasLoaded && !isLoading && errorMessage is null)
+{
+    <div class="banner info">No virtual machines were found in the subscriptions visible to your Azure CLI login.</div>
+}
+
+@code {
+    private List<VmCostRow> rows = [];
+    private string currency = "USD";
+    private bool includeDeallocated;
+    private bool isLoading = true;
+    private bool hasLoaded;
+    private string loadingStage = "Connecting…";
+    private int pricingDone;
+    private int pricingTotal;
+    private string? errorTitle;
+    private string? errorMessage;
+    private bool showLoginHint;
+    private string sortKey = "name";
+    private bool sortDesc;
+    private CancellationTokenSource? cts;
+
+    private IReadOnlyList<VmRecord> inventory = [];
+
+    protected override void OnInitialized()
+    {
+        currency = Calculator.Pricing.DefaultCurrency;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        inventory = [];
+        await LoadAsync(fetchInventory: true);
+    }
+
+    private async Task OnCurrencyChanged(ChangeEventArgs e)
+    {
+        currency = e.Value?.ToString() ?? currency;
+        await LoadAsync(fetchInventory: inventory.Count == 0);
+    }
+
+    private async Task LoadAsync(bool fetchInventory)
+    {
+        cts?.Cancel();
+        cts = new CancellationTokenSource();
+        var ct = cts.Token;
+
+        isLoading = true;
+        errorTitle = errorMessage = null;
+        showLoginHint = false;
+        pricingDone = pricingTotal = 0;
+        rows = [];
+        StateHasChanged();
+
+        try
+        {
+            if (fetchInventory)
+            {
+                loadingStage = "Listing subscriptions…";
+                StateHasChanged();
+                var subs = await Inventory.GetSubscriptionsAsync(ct);
+
+                loadingStage = $"Querying virtual machines across {subs.Count} subscription{(subs.Count == 1 ? "" : "s")}…";
+                StateHasChanged();
+                inventory = await Inventory.GetVirtualMachinesAsync(subs, ct);
+            }
+
+            pricingTotal = inventory.Count;
+            loadingStage = $"Looking up {currency} list prices for {inventory.Count} VMs…";
+            StateHasChanged();
+
+            var progress = new Progress<int>(n =>
+            {
+                pricingDone = n;
+                if (n % 5 == 0 || n == pricingTotal) InvokeAsync(StateHasChanged);
+            });
+
+            var result = await Calculator.BuildRowsAsync(inventory, currency, progress, ct);
+            if (!ct.IsCancellationRequested)
+                rows = result.ToList();
+        }
+        catch (OperationCanceledException)
+        {
+            // superseded by a newer load
+        }
+        catch (CredentialUnavailableException ex)
+        {
+            errorTitle = "Not signed in to Azure";
+            errorMessage = "The app uses your Azure CLI session. Sign in first, then refresh. " + ex.Message;
+            showLoginHint = true;
+        }
+        catch (AuthenticationFailedException ex)
+        {
+            errorTitle = "Azure authentication failed";
+            errorMessage = ex.Message;
+            showLoginHint = true;
+        }
+        catch (Exception ex)
+        {
+            errorTitle = "Something went wrong";
+            errorMessage = ex.Message;
+        }
+        finally
+        {
+            if (!ct.IsCancellationRequested)
+            {
+                isLoading = false;
+                hasLoaded = true;
+                StateHasChanged();
+            }
+        }
+    }
+
+    private bool IncludedInTotals(VmCostRow r) => includeDeallocated || !r.Vm.IsDeallocated;
+
+    private int Count(IncreaseStatus s) => rows.Count(r => r.Status == s);
+
+    private string Money(decimal value) => $"{value.ToString("N2", CultureInfo.InvariantCulture)} {currency}";
+
+    private string MoneyOrDash(decimal? value) => value is null ? "—" : Money(value.Value);
+
+    private static string StatusText(IncreaseStatus s) => s switch
+    {
+        IncreaseStatus.Affected => "Affected",
+        IncreaseStatus.Excluded => "Excluded",
+        IncreaseStatus.NotInScope => "Not in scope",
+        IncreaseStatus.PriceUnknown => "Price unknown",
+        _ => s.ToString()
+    };
+
+    private static string RowClass(VmCostRow r) =>
+        (r.Status.ToString().ToLowerInvariant()) + (r.Vm.IsDeallocated ? " deallocated" : "");
+
+    private void SortBy(string key)
+    {
+        if (sortKey == key) sortDesc = !sortDesc;
+        else { sortKey = key; sortDesc = key is "current" or "projected" or "delta" or "pct"; }
+    }
+
+    private string SortIcon(string key) => sortKey != key ? "" : sortDesc ? "▼" : "▲";
+
+    private IEnumerable<VmCostRow> Sort(IEnumerable<VmCostRow> src)
+    {
+        Func<VmCostRow, object?> selector = sortKey switch
+        {
+            "rg" => r => r.Vm.ResourceGroup,
+            "region" => r => r.Vm.Region,
+            "size" => r => r.Vm.VmSize,
+            "state" => r => r.Vm.PowerStateDisplay,
+            "current" => r => r.MonthlyCost ?? -1,
+            "pct" => r => r.IncreasePercent,
+            "projected" => r => r.ProjectedMonthly ?? -1,
+            "delta" => r => r.MonthlyDelta ?? -1,
+            _ => r => r.Vm.Name
+        };
+        var ordered = sortDesc
+            ? src.OrderByDescending(selector, Comparer<object?>.Create(CompareValues))
+            : src.OrderBy(selector, Comparer<object?>.Create(CompareValues));
+        return ordered.ThenBy(r => r.Vm.Name, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static int CompareValues(object? a, object? b) => (a, b) switch
+    {
+        (decimal x, decimal y) => x.CompareTo(y),
+        (string x, string y) => StringComparer.OrdinalIgnoreCase.Compare(x, y),
+        _ => Comparer<object?>.Default.Compare(a, b)
+    };
+
+    private async Task DownloadCsvAsync()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("Subscription,SubscriptionId,ResourceGroup,VM,Region,Size,Series,OS,PowerState,Currency,HourlyRate,CurrentMonthly,IncreasePercent,ProjectedMonthly,MonthlyDelta,AnnualDelta,Status,Note");
+        foreach (var r in rows.OrderBy(r => r.Vm.SubscriptionName).ThenBy(r => r.Vm.ResourceGroup).ThenBy(r => r.Vm.Name))
+        {
+            sb.AppendLine(string.Join(",",
+                Csv(r.Vm.SubscriptionName), Csv(r.Vm.SubscriptionId), Csv(r.Vm.ResourceGroup), Csv(r.Vm.Name),
+                Csv(r.Vm.Region), Csv(r.Vm.VmSize), Csv(r.Series), Csv(r.Vm.OsType), Csv(r.Vm.PowerStateDisplay),
+                currency,
+                Num(r.HourlyRate), Num(r.MonthlyCost), r.IncreasePercent.ToString(CultureInfo.InvariantCulture),
+                Num(r.ProjectedMonthly), Num(r.MonthlyDelta), Num(r.MonthlyDelta * 12),
+                StatusText(r.Status), Csv(r.Note ?? "")));
+        }
+        var fileName = $"vm-price-increase-{DateTime.Now:yyyyMMdd-HHmm}.csv";
+        await JS.InvokeVoidAsync("downloadText", fileName, sb.ToString());
+
+        static string Csv(string s) => s.Contains(',') || s.Contains('"') || s.Contains('\n') ? $"\"{s.Replace("\"", "\"\"")}\"" : s;
+        static string Num(decimal? d) => d?.ToString("0.####", CultureInfo.InvariantCulture) ?? "";
+    }
+
+    public void Dispose()
+    {
+        cts?.Cancel();
+        cts?.Dispose();
+    }
+}
